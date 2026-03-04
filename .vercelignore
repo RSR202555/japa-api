@@ -1,6 +1,5 @@
 node-api/
-storage/logs/
-storage/framework/cache/
-storage/framework/sessions/
-storage/framework/views/
+vendor/
+storage/
 bootstrap/cache/
+api/index.php
