@@ -1,0 +1,4 @@
+node-api/
+vendor/
+storage/
+bootstrap/cache/
