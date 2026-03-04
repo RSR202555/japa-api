@@ -1,0 +1,5 @@
+api/auth/
+api/admin/
+api/aluno/
+api/health.js
+api/plans.js

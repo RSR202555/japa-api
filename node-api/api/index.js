@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
+import crypto from 'crypto';
 
 const globalForPrisma = globalThis;
 const prisma = globalForPrisma.__prisma ?? new PrismaClient();
@@ -54,6 +55,35 @@ function verifyToken(token) {
   const secret = process.env.JWT_SECRET;
   if (!secret) throw new Error('Missing JWT_SECRET');
   return jwt.verify(token, secret);
+}
+
+function env(name, fallback = null) {
+  const v = process.env[name];
+  return v === undefined || v === '' ? fallback : v;
+}
+
+function makeOrderNsu() {
+  return crypto.randomUUID();
+}
+
+async function fetchJson(url, options) {
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options?.headers ?? {}),
+    },
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const err = new Error('Request failed');
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
 }
 
 async function requireAdmin(req, res) {
@@ -525,6 +555,151 @@ async function handleAlunoProtocolo(req, res) {
   return json(res, 200, { assignment: { id: Number(a.id), notes: a.notes, assigned_at: a.assigned_at, protocol: { id: Number(a.protocol.id), title: a.protocol.title, type: a.protocol.type, content: a.protocol.content } } });
 }
 
+async function handleStudentInfinitePayCheckout(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { message: 'Method not allowed' });
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+
+  const handle = env('INFINITEPAY_HANDLE');
+  const redirectUrlBase = env('INFINITEPAY_REDIRECT_URL');
+  const webhookUrl = env('INFINITEPAY_WEBHOOK_URL');
+  if (!handle) return json(res, 500, { message: 'Missing INFINITEPAY_HANDLE' });
+  if (!redirectUrlBase) return json(res, 500, { message: 'Missing INFINITEPAY_REDIRECT_URL' });
+  if (!webhookUrl) return json(res, 500, { message: 'Missing INFINITEPAY_WEBHOOK_URL' });
+
+  const bodySchema = z.object({ plan_id: z.number().int().positive() });
+  let body;
+  try { body = (await readJsonBody(req)) ?? {}; } catch { return json(res, 400, { message: 'Invalid JSON.' }); }
+  let parsed;
+  try { parsed = bodySchema.parse(body); } catch (e) { return json(res, 422, { message: 'Validation error', errors: e?.errors ?? [] }); }
+
+  const plan = await prisma.plan.findUnique({ where: { id: BigInt(parsed.plan_id) } });
+  if (!plan || !plan.is_active) return json(res, 404, { message: 'Plano não encontrado.' });
+
+  const now = new Date();
+  const orderNsu = makeOrderNsu();
+  const amountCents = Math.max(0, Math.round(parseFloat(plan.price.toString()) * 100));
+
+  const subscription = await prisma.subscription.create({
+    data: {
+      user_id: auth.userId,
+      plan_id: plan.id,
+      status: 'pending',
+      starts_at: null,
+      expires_at: null,
+      created_at: now,
+      updated_at: now,
+    },
+  });
+
+  await prisma.transaction.create({
+    data: {
+      user_id: auth.userId,
+      subscription_id: subscription.id,
+      amount: plan.price,
+      status: 'pending',
+      payment_method: 'infinitepay',
+      external_id: orderNsu,
+      created_at: now,
+      updated_at: now,
+    },
+  });
+
+  const redirectUrl = new URL(redirectUrlBase);
+  redirectUrl.searchParams.set('order_nsu', orderNsu);
+  redirectUrl.searchParams.set('plan_id', String(parsed.plan_id));
+
+  const payload = {
+    handle,
+    redirect_url: redirectUrl.toString(),
+    webhook_url: webhookUrl,
+    order_nsu: orderNsu,
+    items: [{ quantity: 1, price: amountCents, description: plan.name }],
+  };
+
+  let linkResp;
+  try {
+    linkResp = await fetchJson('https://api.infinitepay.io/invoices/public/checkout/links', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.error('InfinitePay link error', e?.status, e?.data ?? e);
+    return json(res, 502, { message: 'Falha ao gerar link de pagamento.' });
+  }
+
+  return json(res, 200, {
+    checkout_url: linkResp?.url ?? null,
+    order_nsu: orderNsu,
+  });
+}
+
+async function handleInfinitePayWebhook(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { message: 'Method not allowed' });
+
+  let body;
+  try { body = (await readJsonBody(req)) ?? {}; } catch { return json(res, 400, { message: 'Invalid JSON.' }); }
+
+  const schema = z.object({
+    order_nsu: z.string().min(1),
+    transaction_nsu: z.string().min(1),
+    invoice_slug: z.string().min(1),
+    amount: z.number().optional(),
+    paid_amount: z.number().optional(),
+    installments: z.number().optional(),
+    capture_method: z.string().optional(),
+    receipt_url: z.string().optional(),
+  });
+
+  let parsed;
+  try { parsed = schema.parse(body); } catch (e) { return json(res, 422, { message: 'Validation error', errors: e?.errors ?? [] }); }
+
+  const tx = await prisma.transaction.findFirst({
+    where: { external_id: parsed.order_nsu, payment_method: 'infinitepay' },
+  });
+
+  if (!tx) {
+    return json(res, 200, { received: true });
+  }
+
+  if (tx.status === 'paid') {
+    return json(res, 200, { received: true });
+  }
+
+  const now = new Date();
+
+  await prisma.transaction.update({
+    where: { id: tx.id },
+    data: {
+      status: 'paid',
+      paid_at: now,
+      updated_at: now,
+    },
+  });
+
+  if (tx.subscription_id) {
+    const sub = await prisma.subscription.findUnique({ where: { id: tx.subscription_id } });
+    if (sub) {
+      const plan = await prisma.plan.findUnique({ where: { id: sub.plan_id } });
+      const startsAt = now;
+      const expiresAt = plan
+        ? new Date(startsAt.getTime() + (plan.duration_days ?? 30) * 86400000)
+        : null;
+      await prisma.subscription.update({
+        where: { id: sub.id },
+        data: {
+          status: 'active',
+          starts_at: startsAt,
+          expires_at: expiresAt,
+          updated_at: now,
+        },
+      });
+    }
+  }
+
+  return json(res, 200, { received: true });
+}
+
 // ── Main Router ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -546,6 +721,9 @@ export default async function handler(req, res) {
     if (segs[0] === 'health')                         return json(res, 200, { ok: true });
 
     if (segs[0] === 'aluno' && segs[1] === 'protocolo') return await handleAlunoProtocolo(req, res);
+    if (segs[0] === 'student' && segs[1] === 'checkout' && segs[2] === 'infinitepay') return await handleStudentInfinitePayCheckout(req, res);
+
+    if (segs[0] === 'webhooks' && segs[1] === 'infinitepay') return await handleInfinitePayWebhook(req, res);
 
     if (segs[0] === 'admin' && segs[1] === 'dashboard') return await handleDashboard(req, res);
 
