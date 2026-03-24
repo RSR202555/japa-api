@@ -516,6 +516,75 @@ async function handlePublicPlans(req, res) {
   return json(res, 200, raw.map(serializePlan));
 }
 
+async function handleCheckout(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { message: 'Method not allowed' });
+
+  let body;
+  try { body = (await readJsonBody(req)) ?? {}; } catch { return json(res, 400, { message: 'JSON inválido.' }); }
+
+  const schema = z.object({
+    name:    z.string().min(3).max(255),
+    email:   z.string().email().max(255),
+    phone:   z.string().max(20).optional().nullable(),
+    plan_id: z.coerce.number().int().positive(),
+  });
+
+  let parsed;
+  try { parsed = schema.parse(body); } catch (e) {
+    return json(res, 422, { message: 'Dados inválidos.', errors: e?.errors ?? [] });
+  }
+
+  // Bloquear se já tem conta
+  const existing = await prisma.user.findUnique({ where: { email: parsed.email } });
+  if (existing) {
+    return json(res, 409, {
+      message: 'Já existe uma conta com este e-mail. Faça login para acessar.',
+      redirect: '/login',
+    });
+  }
+
+  // Verificar plano
+  const plan = await prisma.plan.findUnique({ where: { id: BigInt(parsed.plan_id) } });
+  if (!plan || !plan.is_active) {
+    return json(res, 422, { message: 'Plano não encontrado ou indisponível.' });
+  }
+
+  const secretKey = process.env.INFINITYPAY_SECRET_KEY;
+  const apiUrl    = process.env.INFINITYPAY_API_URL ?? 'https://api.infinitepay.io/v3';
+
+  if (!secretKey) {
+    console.error('INFINITYPAY_SECRET_KEY not set');
+    return json(res, 502, { message: 'Serviço de pagamento não configurado. Entre em contato com o suporte.' });
+  }
+
+  const chargeRes = await fetch(`${apiUrl}/charges`, {
+    method:  'POST',
+    headers: { 'Authorization': `Bearer ${secretKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({
+      amount:      Math.round(parseFloat(plan.price.toString()) * 100),
+      currency:    'BRL',
+      description: `Japa Treinador - ${plan.name}`,
+      customer:    { name: parsed.name, email: parsed.email, phone: parsed.phone ?? undefined },
+      metadata:    { type: 'new_registration', plan_id: Number(plan.id), customer_name: parsed.name, customer_email: parsed.email },
+    }),
+  });
+
+  if (!chargeRes.ok) {
+    const errData = await chargeRes.json().catch(() => ({}));
+    console.error('InfinityPay error:', errData);
+    return json(res, 502, { message: 'Falha ao criar cobrança. Tente novamente.' });
+  }
+
+  const charge     = await chargeRes.json();
+  const paymentUrl = charge.payment_url ?? charge.checkout_url ?? null;
+
+  if (!paymentUrl) {
+    return json(res, 502, { message: 'Falha ao obter link de pagamento.' });
+  }
+
+  return json(res, 200, { message: 'Checkout criado com sucesso.', payment_url: paymentUrl });
+}
+
 async function handleAlunoProtocolo(req, res) {
   if (req.method !== 'GET') return json(res, 405, { message: 'Method not allowed' });
   const auth = await requireAuth(req, res);
@@ -545,6 +614,7 @@ export default async function handler(req, res) {
 
     // Public
     if (segs[0] === 'plans' && !segs[1])            return await handlePublicPlans(req, res);
+    if (segs[0] === 'checkout' && !segs[1])         return await handleCheckout(req, res);
     if (segs[0] === 'health')                        return json(res, 200, { ok: true });
 
     // Aluno
