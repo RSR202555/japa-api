@@ -549,38 +549,21 @@ async function handleCheckout(req, res) {
     return json(res, 422, { message: 'Plano não encontrado ou indisponível.' });
   }
 
-  const secretKey = process.env.INFINITYPAY_SECRET_KEY;
-  const apiUrl    = process.env.INFINITYPAY_API_URL ?? 'https://api.infinitepay.io/v3';
+  const handle      = process.env.INFINITEPAY_HANDLE;
+  const redirectUrl = process.env.INFINITEPAY_REDIRECT_URL;
 
-  if (!secretKey) {
-    console.error('INFINITYPAY_SECRET_KEY not set');
+  if (!handle) {
+    console.error('INFINITEPAY_HANDLE not set');
     return json(res, 502, { message: 'Serviço de pagamento não configurado. Entre em contato com o suporte.' });
   }
 
-  const chargeRes = await fetch(`${apiUrl}/charges`, {
-    method:  'POST',
-    headers: { 'Authorization': `Bearer ${secretKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({
-      amount:      Math.round(parseFloat(plan.price.toString()) * 100),
-      currency:    'BRL',
-      description: `Japa Treinador - ${plan.name}`,
-      customer:    { name: parsed.name, email: parsed.email, phone: parsed.phone ?? undefined },
-      metadata:    { type: 'new_registration', plan_id: Number(plan.id), customer_name: parsed.name, customer_email: parsed.email },
-    }),
-  });
+  const amount      = parseFloat(plan.price.toString()).toFixed(2);
+  const description = encodeURIComponent(`Japa Treinador - ${plan.name}`);
+  const email       = encodeURIComponent(parsed.email);
+  const name        = encodeURIComponent(parsed.name);
 
-  if (!chargeRes.ok) {
-    const errData = await chargeRes.json().catch(() => ({}));
-    console.error('InfinityPay error:', errData);
-    return json(res, 502, { message: 'Falha ao criar cobrança. Tente novamente.' });
-  }
-
-  const charge     = await chargeRes.json();
-  const paymentUrl = charge.payment_url ?? charge.checkout_url ?? null;
-
-  if (!paymentUrl) {
-    return json(res, 502, { message: 'Falha ao obter link de pagamento.' });
-  }
+  let paymentUrl = `https://checkout.infinitepay.io/${handle}?amount=${amount}&description=${description}&customer_email=${email}&customer_name=${name}`;
+  if (redirectUrl) paymentUrl += `&redirect_url=${encodeURIComponent(redirectUrl)}`;
 
   return json(res, 200, { message: 'Checkout criado com sucesso.', payment_url: paymentUrl });
 }
